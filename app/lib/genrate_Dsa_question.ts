@@ -1,7 +1,11 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import prisma from "./db";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+function getGenAI() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
+  return new GoogleGenerativeAI(apiKey);
+}
 
 const systemPrompt = `
 You are an expert competitive programming problem setter.
@@ -77,7 +81,7 @@ async function generateWithRetry(model: any, prompt: string, maxRetries = 10) {
 export async function generateProblemContent() {
   // Switching to 'gemini-pro' as it's the most stable and widely available model.
   // gemini-1.5-flash seems to be restricted or returning 404 in this environment.
- const model = genAI.getGenerativeModel({
+ const model = getGenAI().getGenerativeModel({
   model: "gemini-2.5-flash",
 });
 
