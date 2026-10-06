@@ -13,16 +13,11 @@ const Header = () => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const navLinks = isSignedIn
-    ? [
-        { label: "Dashboard", href: "/candidate/dashboard" },
-        { label: "Interviews", href: "/candidate/interviews" },
-        { label: "Reports", href: "/candidate/reports" },
-      ]
+    ? [{ label: "Practice", href: "/dashboard" }]
     : [
         { label: "Features", href: "#features" },
-        { label: "Solutions", href: "#solutions" },
+        { label: "How it works", href: "#solutions" },
         { label: "Pricing", href: "#pricing" },
-        { label: "About", href: "#about" },
       ];
 
   const isActive = (href: string) => pathname === href;
@@ -30,15 +25,15 @@ const Header = () => {
   return (
     <header className="sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur-sm">
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6 sm:px-8 lg:px-12">
-        {/* Logo */}
         <Link href="/" className="flex items-center gap-2 group flex-shrink-0">
           <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary text-primary-foreground font-semibold text-lg">
             I
           </div>
-          <span className="text-lg font-semibold tracking-tight text-foreground hidden sm:inline">Intervu</span>
+          <span className="text-lg font-semibold tracking-tight text-foreground hidden sm:inline">
+            Intervu
+          </span>
         </Link>
 
-        {/* Desktop Navigation */}
         <nav className="hidden md:flex items-center gap-8">
           {navLinks.map((link) => (
             <Link
@@ -55,40 +50,37 @@ const Header = () => {
           ))}
         </nav>
 
-        {/* Right side */}
         <div className="flex items-center gap-3 sm:gap-4">
           {!isSignedIn ? (
             <>
               <SignInButton mode="modal">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="hidden sm:inline-flex"
-                >
+                <Button variant="outline" size="sm" className="hidden sm:inline-flex">
                   Sign In
                 </Button>
               </SignInButton>
-              <Link href="/candidate/dashboard">
-                <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground">
-                  Get Started
+              <Link href="/dashboard">
+                <Button
+                  size="sm"
+                  className="bg-primary hover:bg-primary/90 text-primary-foreground"
+                >
+                  Start practicing
                 </Button>
               </Link>
             </>
           ) : (
-            <>
-              <UserButton
-                afterSignOutUrl="/"
-                appearance={{
-                  elements: {
-                    userButtonAvatarBox: "w-9 h-9 rounded-lg border border-border shadow-sm hover:bg-secondary transition-colors",
-                    userButtonPopoverCard: "mt-2 border border-border shadow-lg rounded-lg bg-card",
-                  },
-                }}
-              />
-            </>
+            <UserButton
+              afterSignOutUrl="/"
+              appearance={{
+                elements: {
+                  userButtonAvatarBox:
+                    "w-9 h-9 rounded-lg border border-border shadow-sm hover:bg-secondary transition-colors",
+                  userButtonPopoverCard:
+                    "mt-2 border border-border shadow-lg rounded-lg bg-card",
+                },
+              }}
+            />
           )}
 
-          {/* Mobile menu button */}
           <button
             className="md:hidden p-2 hover:bg-secondary rounded-lg transition-colors"
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
@@ -102,7 +94,6 @@ const Header = () => {
         </div>
       </div>
 
-      {/* Mobile Navigation */}
       {mobileMenuOpen && (
         <div className="md:hidden border-t border-border bg-background">
           <nav className="flex flex-col gap-2 p-4">

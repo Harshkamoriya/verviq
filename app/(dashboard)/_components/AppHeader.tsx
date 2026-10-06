@@ -33,7 +33,7 @@ export default function AppHeader() {
         <div className="flex h-16 items-center justify-between gap-4">
           <div className="flex min-w-0 flex-col gap-1">
             <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Dashboard
+              Practice coach
             </span>
 
             <motion.h1
