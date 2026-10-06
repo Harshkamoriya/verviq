@@ -48,12 +48,14 @@ type TurnState = "idle" | "ai_thinking" | "ai_speaking" | "your_turn" | "listeni
 // can isolate whether LiveKit is interfering with the AssemblyAI audio pipeline.
 const ENABLE_LIVEKIT = false;
 
-// AssemblyAI native end-of-turn tuning. Higher confidence threshold / more
-// silence = safer against cutting the candidate off, but slower to respond.
-// Lower = snappier, more risk of premature submission.
-const END_OF_TURN_CONFIDENCE_THRESHOLD = 0.7;
-const MIN_END_OF_TURN_SILENCE_WHEN_CONFIDENT = 400; // ms, used when model is confident
-const MAX_TURN_SILENCE = 2400; // ms, hard fallback ceiling when model isn't confident
+// AssemblyAI end-of-turn = their VAD. Tuned so brief thinking pauses don't
+ // cut you off, while still auto-submitting after a real stop.
+const END_OF_TURN_CONFIDENCE_THRESHOLD = 0.85;
+const MIN_END_OF_TURN_SILENCE_WHEN_CONFIDENT = 1800; // ms — wait after you stop talking
+const MAX_TURN_SILENCE = 5000; // ms hard ceiling after last speech
+const MIN_UTTERANCE_CHARS = 12; // ignore tiny/noise "end_of_turn" events
+const MIN_SPEECH_MS_BEFORE_AUTO_SUBMIT = 1500; // don't auto-send ultra-short bursts
+const STT_RECONNECT_DELAY_MS = 800;
 
 const InterviewPage = () => {
   const { sessionId } = useParams();
@@ -85,8 +87,23 @@ const InterviewPage = () => {
   // Use a ref for the send callback so the AssemblyAI ws handler can always
   // call the latest version without needing to be re-created.
   const sendReplyCallbackRef = useRef<(text: string) => void>(() => {});
+  const turnStateRef = useRef<TurnState>("idle");
+  const isStartedRef = useRef(false);
+  const isSubmittingRef = useRef(false);
+  const wantListeningRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestPartialRef = useRef("");
+  const speechStartedAtRef = useRef<number | null>(null);
 
   const coach = getCoachPersona(sessionData?.modelVersion ?? sessionData?.aiInterviewerId);
+
+  useEffect(() => {
+    turnStateRef.current = turnState;
+  }, [turnState]);
+
+  useEffect(() => {
+    isStartedRef.current = isStarted;
+  }, [isStarted]);
 
   const connectLiveKit = async () => {
     if (!ENABLE_LIVEKIT) {
@@ -128,11 +145,14 @@ const InterviewPage = () => {
   useEffect(() => {
     fetchTranscript();
     return () => {
-      stopRealtimeSTT();
+      wantListeningRef.current = false;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      stopRealtimeSTT(false);
       stopCamera();
       speechSynthesis.cancel();
       if (timerInterval.current) clearInterval(timerInterval.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchTranscript]);
 
   useEffect(() => {
@@ -256,14 +276,19 @@ const InterviewPage = () => {
 
   const startRealtimeSTT = async () => {
     if (socketRef.current?.readyState === WebSocket.OPEN) return;
+    if (isSubmittingRef.current) return;
+
+    wantListeningRef.current = true;
     setMicError(null);
     setTurnState("listening");
+    latestPartialRef.current = "";
+    speechStartedAtRef.current = null;
 
     try {
       const tokenRes = await fetch("/api/getToken");
       const tokenData = await tokenRes.json();
       const token = tokenData.token;
-      if (!token) throw new Error("No STT token");
+      if (!token) throw new Error(tokenData.error || "No STT token");
 
       const params = new URLSearchParams({
         sample_rate: "16000",
@@ -282,42 +307,39 @@ const InterviewPage = () => {
 
       ws.onopen = async () => {
         console.log("[AAI ws] connection opened");
+        if (!wantListeningRef.current) {
+          ws.close();
+          return;
+        }
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           micStreamRef.current = stream;
-          console.log("[AAI ws] mic acquired, tracks:", stream.getAudioTracks().length);
 
-          if (ENABLE_LIVEKIT) {
-            if (roomRef.current) {
-              console.log("Publishing to LiveKit...");
-              const audioTrack = stream.getAudioTracks()[0];
-              await roomRef.current.localParticipant.publishTrack(audioTrack);
-              console.log("✅ Mic published to LiveKit");
-            } else {
-              console.log("❌ roomRef.current is null");
-            }
+          if (ENABLE_LIVEKIT && roomRef.current) {
+            const audioTrack = stream.getAudioTracks()[0];
+            await roomRef.current.localParticipant.publishTrack(audioTrack);
           }
 
           const audioContext = new AudioContext({ sampleRate: 16000 });
-          console.log("[AAI ws] AudioContext state:", audioContext.state);
+          if (audioContext.state === "suspended") {
+            await audioContext.resume();
+          }
           const source = audioContext.createMediaStreamSource(stream);
           const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
           source.connect(processor);
           processor.connect(audioContext.destination);
 
-          let chunkCount = 0;
           processor.onaudioprocess = (e) => {
+            if (!wantListeningRef.current) return;
+            const state = turnStateRef.current;
+            // Don't stream mic audio while AI is talking / thinking.
+            if (state !== "listening" && state !== "your_turn") return;
+
             const inputData = e.inputBuffer.getChannelData(0);
             const buffer = floatTo16BitPCM(inputData);
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(buffer);
-              chunkCount++;
-              if (chunkCount % 50 === 0) {
-                console.log(`[AAI ws] sent ${chunkCount} audio chunks so far`);
-              }
-            } else if (chunkCount === 0) {
-              console.warn("[AAI ws] audioprocess firing but ws not OPEN, readyState:", ws.readyState);
             }
           };
 
@@ -325,10 +347,12 @@ const InterviewPage = () => {
           processorRef.current = processor;
           sourceRef.current = source;
           setIsRecording(true);
+          setTurnState("listening");
         } catch {
           setMicError("Microphone permission denied");
           toast.error("Microphone permission denied — use the Send button to type replies");
           setTurnState("your_turn");
+          wantListeningRef.current = false;
         }
       };
 
@@ -336,58 +360,107 @@ const InterviewPage = () => {
         try {
           const payload = JSON.parse(msg.data);
 
-          // DEBUG: log every message type we get from AssemblyAI so we can see
-          // Begin / Turn / Error / Termination events while diagnosing.
-          console.log("[AAI ws] message_type:", payload.type, payload);
-
           if (payload.type === "Error") {
-            console.error("[AAI ws] AssemblyAI returned an Error message:", payload);
+            console.error("[AAI ws] AssemblyAI Error:", payload);
             toast.error(payload.error ?? "Speech service error");
             return;
           }
 
-          // AssemblyAI v3 streaming sends message_type: "Turn" for every update.
-          // payload.transcript          -> current text for this turn
-          // payload.end_of_turn         -> true once the model decides the turn is done
-          // payload.turn_is_formatted   -> true once punctuation/casing applied
-          // payload.end_of_turn_confidence -> 0..1 confidence for the end-of-turn call
           if (payload.type !== "Turn") return;
 
+          // Ignore STT events while AI owns the floor.
+          const state = turnStateRef.current;
+          if (state === "ai_speaking" || state === "ai_thinking" || state === "idle") {
+            return;
+          }
+
           const text: string = (payload.transcript ?? "").trim();
-
-          if (payload.end_of_turn) {
-            // Wait for the formatted version so the submitted text has proper
-            // punctuation/casing — the unformatted end_of_turn event fires first.
-            if (!payload.turn_is_formatted) return;
-            if (!text) return;
-
-            console.log(
-              `[AAI ws] end_of_turn (confidence=${payload.end_of_turn_confidence}):`,
-              text
-            );
-            sendReplyCallbackRef.current(text);
-          } else if (text) {
+          if (text) {
+            latestPartialRef.current = text;
+            if (!speechStartedAtRef.current) {
+              speechStartedAtRef.current = Date.now();
+            }
             setReply(text);
           }
+
+          if (!payload.end_of_turn) return;
+          // Wait for formatted turn so punctuation/casing is applied.
+          if (!payload.turn_is_formatted) return;
+          if (isSubmittingRef.current) return;
+
+          const finalText = text || latestPartialRef.current;
+          if (!finalText || finalText.length < MIN_UTTERANCE_CHARS) {
+            // Silence / noise — keep listening. Do NOT kill the session.
+            console.log("[AAI ws] ignoring empty/short end_of_turn:", finalText);
+            return;
+          }
+
+          const spokenFor = speechStartedAtRef.current
+            ? Date.now() - speechStartedAtRef.current
+            : 0;
+          if (spokenFor < MIN_SPEECH_MS_BEFORE_AUTO_SUBMIT) {
+            console.log("[AAI ws] ignoring premature end_of_turn:", spokenFor, "ms");
+            return;
+          }
+
+          console.log(
+            `[AAI ws] end_of_turn (confidence=${payload.end_of_turn_confidence}):`,
+            finalText
+          );
+          sendReplyCallbackRef.current(finalText);
         } catch (err) {
-          console.error("[AAI ws] parse error", err, "raw data:", msg.data);
+          console.error("[AAI ws] parse error", err);
         }
       };
 
       ws.onerror = (e) => {
         console.error("[AAI ws] error", e);
-        toast.error("Speech connection lost — use Send Reply as fallback");
-        setTurnState("your_turn");
+        toast.error("Speech connection issue — reconnecting or use Send Reply");
       };
 
       ws.onclose = (e) => {
-        console.warn("[AAI ws] closed — code:", e.code, "reason:", e.reason, "wasClean:", e.wasClean);
-        stopRealtimeSTT(false);
+        console.warn("[AAI ws] closed — code:", e.code, "reason:", e.reason);
+        // Tear down audio graph for this socket, but keep wantListening.
+        try {
+          processorRef.current?.disconnect();
+          sourceRef.current?.disconnect();
+          audioContextRef.current?.close();
+          micStreamRef.current?.getTracks().forEach((t) => t.stop());
+        } catch {
+          // ignore
+        }
+        processorRef.current = null;
+        sourceRef.current = null;
+        audioContextRef.current = null;
+        micStreamRef.current = null;
+        socketRef.current = null;
+        setIsRecording(false);
+
+        // If we still expect the candidate to speak, auto-reconnect.
+        // This fixes "I stayed silent on intro, then nothing worked".
+        if (
+          wantListeningRef.current &&
+          isStartedRef.current &&
+          !isSubmittingRef.current &&
+          (turnStateRef.current === "listening" || turnStateRef.current === "your_turn")
+        ) {
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(() => {
+            console.log("[AAI ws] auto-reconnecting STT...");
+            startRealtimeSTT();
+          }, STT_RECONNECT_DELAY_MS);
+        }
       };
-    } catch {
+    } catch (err) {
+      console.error("[AAI] startRealtimeSTT failed", err);
       setMicError("Could not connect to speech service");
       toast.error("Speech service unavailable — use Send Reply button");
       setTurnState("your_turn");
+      // Retry once shortly so a transient token/network blip doesn't kill the interview.
+      if (wantListeningRef.current && isStartedRef.current) {
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = setTimeout(() => startRealtimeSTT(), 2000);
+      }
     }
   };
 
@@ -403,6 +476,11 @@ const InterviewPage = () => {
   };
 
   const stopRealtimeSTT = (resetTurn = true) => {
+    wantListeningRef.current = false;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     try {
       socketRef.current?.close();
       socketRef.current = null;
@@ -418,13 +496,15 @@ const InterviewPage = () => {
       sourceRef.current = null;
       audioContextRef.current = null;
       setIsRecording(false);
-      if (resetTurn && isStarted) setTurnState("your_turn");
+      if (resetTurn && isStartedRef.current) setTurnState("your_turn");
     }
   };
 
   // Keep sendReplyCallbackRef pointing to the latest handleSendReply closure.
   useEffect(() => {
     sendReplyCallbackRef.current = (text: string) => {
+      if (isSubmittingRef.current) return;
+      wantListeningRef.current = false;
       stopRealtimeSTT(false);
       setReply("");
       handleSendReply(text);
@@ -433,6 +513,8 @@ const InterviewPage = () => {
 
   const handleSendReply = async (content: string) => {
     if (!content.trim()) return;
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setTurnState("ai_thinking");
 
     try {
@@ -445,6 +527,7 @@ const InterviewPage = () => {
       if (data.error) {
         toast.error(data.error);
         setTurnState("your_turn");
+        startRealtimeSTT();
         return;
       }
 
@@ -465,11 +548,8 @@ const InterviewPage = () => {
         speak(aiMessage, () => {
           setTurnState("your_turn");
           connectLiveKit()
-            .then(() => {
-              console.log("LiveKit connected");
-              startRealtimeSTT();
-            })
-            .catch(console.error);
+            .then(() => startRealtimeSTT())
+            .catch(() => startRealtimeSTT());
         });
       } else {
         setTurnState("your_turn");
@@ -478,6 +558,9 @@ const InterviewPage = () => {
     } catch {
       toast.error("Failed to send reply");
       setTurnState("your_turn");
+      startRealtimeSTT();
+    } finally {
+      isSubmittingRef.current = false;
     }
   };
 
@@ -747,7 +830,9 @@ const InterviewPage = () => {
                   <MicOff className="h-5 w-5 text-gray-600" />
                 )}
                 <span className="hidden sm:inline">
-                  {isRecording ? "Mic active" : "Mic off"}
+                  {isRecording
+                    ? "Pause ~2s to auto-send, or press Send"
+                    : "Mic off"}
                 </span>
               </div>
 

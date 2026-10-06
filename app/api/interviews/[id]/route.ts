@@ -208,28 +208,32 @@ export async function POST(
       timestamp: new Date().toISOString(),
     });
 
-//     await prisma.interviewSession.update({
-//       where: { id: sessionId },
-//       data: {
-//     transcript:transcript as any
-// , // ✅ FIXED
-//         status: "IN_PROGRESS",
-//         startedAt: new Date(),
-//       },
-//     });
+    // Fetch resume context ONCE at interview start — reuse on every later turn.
+    // Do NOT re-chunk / re-embed the resume on each reply.
+    let resumeContext = session.resumeContext ?? "";
+    if (!resumeContext && session.resumeId) {
+      try {
+        const chunks = await queryResumeChunks(
+          session.resumeId,
+          "Key skills, projects, work experience, education, and achievements.",
+          12
+        );
+        resumeContext = chunks.map((c) => c.content).join("\n\n");
+      } catch (err) {
+        console.warn("Failed to prefetch resume context at start:", err);
+      }
+    }
 
-
-await prisma.interviewSession.update({
-  where: { id: sessionId },
-  data: {
-    transcript: transcript as any,
-    interviewMemory: createEmptyMemory() as any, // ✅ new
-    status: "IN_PROGRESS",
-    startedAt: new Date(),
-  },
-});
-
-
+    await prisma.interviewSession.update({
+      where: { id: sessionId },
+      data: {
+        transcript: transcript as any,
+        interviewMemory: createEmptyMemory() as any,
+        resumeContext: resumeContext || null,
+        status: "IN_PROGRESS",
+        startedAt: new Date(),
+      },
+    });
 
     return NextResponse.json({
       success: true,
@@ -267,156 +271,92 @@ await prisma.interviewSession.update({
   }));
 
   try {
-    let resumeContext = "";
+    // Reuse session resume context (fetched once at start). Lazy-fill if missing.
+    let resumeContext = session.resumeContext ?? "";
+    if (!resumeContext && session.resumeId) {
+      try {
+        const chunks = await queryResumeChunks(
+          session.resumeId,
+          "Key skills, projects, work experience, education, and achievements.",
+          12
+        );
+        resumeContext = chunks.map((c) => c.content).join("\n\n");
+        await prisma.interviewSession.update({
+          where: { id: sessionId },
+          data: { resumeContext },
+        });
+      } catch (err) {
+        console.warn("Failed to lazy-load resume context:", err);
+      }
+    }
+
     let geminiResponse: GeminiInterviewResponse;
     const coach = getCoachPersona(session.modelVersion ?? session.aiInterviewerId);
     const personaPrompt = `${coach.systemPromptAddition}\n\n${INTERVIEW_SYSTEM_PROMPT}`;
-    
-    if (current.type === "intro") {
-      const prompt = personaPrompt.replace(
-        "{jobRole}",
-        session.jobRole ?? "Software Engineer"
-      ).replace("{resumeContext}", "")
-       .replace("{interviewMemory}", formatMemoryForPrompt(memory))
-       .replace("{targetDifficulty}", memory.currentDifficulty);
 
-      const fullPrompt = `${prompt}\n\nConversation history: ${JSON.stringify(
-        history
-      )}\nCandidate reply: "${reply}"`;
+    const prompt = personaPrompt
+      .replace("{jobRole}", session.jobRole ?? "Software Engineer")
+      .replace("{resumeContext}", resumeContext)
+      .replace("{interviewMemory}", formatMemoryForPrompt(memory))
+      .replace("{targetDifficulty}", memory.currentDifficulty);
 
-      const rawResponse = await generateWithGemini(fullPrompt);
-      geminiResponse = safeParseJSON<GeminiInterviewResponse>(rawResponse, {
-        analysis: {
-          correctness: 5,
-          relevance: 5,
-          confidence: "Medium",
-          reason: "Fallback response",
-        },
-        score: 5,
-        nextMessage: "Could you share more about a key project you’ve worked on?",
-        type: "question",
-        endInterview: false,
-      });
+    const fullPrompt = `${prompt}\n\nConversation history: ${JSON.stringify(
+      history
+    )}\nCandidate reply: "${reply}"`;
 
+    const rawResponse = await generateWithGemini(fullPrompt);
+    geminiResponse = safeParseJSON<GeminiInterviewResponse>(rawResponse, {
+      analysis: {
+        correctness: 5,
+        relevance: 5,
+        confidence: "Medium",
+        reason: "Fallback response",
+      },
+      score: 5,
+      nextMessage:
+        current.type === "intro"
+          ? "Could you share more about a key project you've worked on?"
+          : "Can you elaborate on that topic further?",
+      type: current.type === "intro" ? "question" : "followup",
+      endInterview: false,
+    });
 
-      if (
-        geminiResponse.analysis.correctness < 5 ||
-        geminiResponse.analysis.relevance < 5
-      ) {
-        const chunks = session.resumeId
-          ? await queryResumeChunks(session.resumeId, "Key skills, projects, and experiences.", 10)
-          : [];
-        resumeContext = chunks.map((c) => c.content).join("\n\n");
-      }
+    transcript.push({
+      type: "reply",
+      question: current.type === "intro" ? undefined : current.message,
+      reply,
+      sentiment: {
+        confidence: geminiResponse.analysis.confidence,
+        reason: geminiResponse.analysis.reason,
+      },
+      timestamp: new Date().toISOString(),
+    });
 
+    if (geminiResponse.nextMessage) {
       transcript.push({
-        type: "reply",
-        reply,
-        sentiment: {
-          confidence: geminiResponse.analysis.confidence,
-          reason: geminiResponse.analysis.reason,
-        },
+        type: geminiResponse.type,
+        message: geminiResponse.nextMessage,
         timestamp: new Date().toISOString(),
       });
+    }
 
-      if (geminiResponse.nextMessage) {
-        transcript.push({
-          type: geminiResponse.type,
-          message: geminiResponse.nextMessage,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      scores.push({
-        question: current.message || "Intro",
-        score: geminiResponse.score,
-        reason: geminiResponse.analysis.reason,
-        sentiment: geminiResponse.analysis.confidence,
-      });
-    } else {
-      // Regular Q&A flow
-      const query = `${current.message} ${reply}`;
-      const chunks = session.resumeId
-        ? await queryResumeChunks(session.resumeId, query, 5)
-        : [];
-      resumeContext = chunks.map((c) => c.content).join("\n\n");
-    
-
-
-      // const prompt = personaPrompt.replace(
-      //   "{jobRole}",
-      //   session.jobRole ?? "Software Engineer"
-      // ).replace("{resumeContext}", resumeContext);
-
-
-  //     const prompt = personaPrompt
-  // .replace("{jobRole}", session.jobRole ?? "Software Engineer")
-  // .replace("{resumeContext}", resumeContext)
-  // .replace("{interviewMemory}", formatMemoryForPrompt(memory)); // ✅ new
-
-  const prompt = personaPrompt
-  .replace("{jobRole}", session.jobRole ?? "Software Engineer")
-  .replace("{resumeContext}", resumeContext)
-  .replace("{interviewMemory}", formatMemoryForPrompt(memory))
-  .replace("{targetDifficulty}", memory.currentDifficulty); // ✅ add — use CURRENT difficulty, not next
-
-      const fullPrompt = `${prompt}\n\nConversation history: ${JSON.stringify(
-        history
-      )}\nCandidate reply: "${reply}"`;
-
-      const rawResponse = await generateWithGemini(fullPrompt);
-      geminiResponse = safeParseJSON<GeminiInterviewResponse>(rawResponse, {
-        analysis: {
-          correctness: 5,
-          relevance: 5,
-          confidence: "Medium",
-          reason: "Fallback response",
-        },
-        score: 5,
-        nextMessage: "Can you elaborate on that topic further?",
-        type: "followup",
-        endInterview: false,
-      });
-
-
-
-      transcript.push({
-        type: "reply",
-        question: current.message,
-        reply,
-        sentiment: {
-          confidence: geminiResponse.analysis.confidence,
-          reason: geminiResponse.analysis.reason,
-        },
-        timestamp: new Date().toISOString(),
-      });
-
-      if (geminiResponse.nextMessage) {
-        transcript.push({
-          type: geminiResponse.type,
-          message: geminiResponse.nextMessage,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      scores.push({
-        question: current.message || "Q",
-        score: geminiResponse.score,
-        reason: geminiResponse.analysis.reason,
-        sentiment: geminiResponse.analysis.confidence,
-      });
+    scores.push({
+      question: current.message || (current.type === "intro" ? "Intro" : "Q"),
+      score: geminiResponse.score,
+      reason: geminiResponse.analysis.reason,
+      sentiment: geminiResponse.analysis.confidence,
+    });
 
     if (geminiResponse.endInterview) {
-        await updateSession(sessionId, transcript, [], scores); // ✅ persist before ending
-       const result =  await generateFinalInterviewReport(sessionId);
-        return NextResponse.json({
-          ended: true,
-          aiMessage: geminiResponse.nextMessage || null,
-          transcript,
-          finalReport: result.finalReport,
-          result
-        });
-      }
+      await updateSession(sessionId, transcript, [], scores);
+      const result = await generateFinalInterviewReport(sessionId);
+      return NextResponse.json({
+        ended: true,
+        aiMessage: geminiResponse.nextMessage || null,
+        transcript,
+        finalReport: result.finalReport,
+        result,
+      });
     }
 
     const nextDifficulty = computeNextDifficulty(
