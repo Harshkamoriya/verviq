@@ -2,17 +2,32 @@ import { NextResponse, NextRequest } from "next/server";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { getAuth, currentUser } from "@clerk/nextjs/server";
 import { v4 as uuidv4 } from "uuid";
-import { pdf } from "pdf-parse";
 
 import prisma from "@/app/lib/db";
 import { embedTextWithGemini } from "@/app/lib/gemini";
 
-// Vercel serverless: give upload enough time for PDF parse + embeddings.
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
 function jsonError(message: string, status = 500, extra?: Record<string, unknown>) {
   return NextResponse.json({ success: false, message, ...extra }, { status });
+}
+
+/** Quick prod debug: open /api/upload in browser to see which env keys exist (no secrets). */
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    env: {
+      DATABASE_URL: !!process.env.DATABASE_URL,
+      PINECONE_API_KEY: !!process.env.PINECONE_API_KEY,
+      PINECONE_INDEX_NAME: !!(
+        process.env.PINECONE_INDEX_NAME || process.env.INDEX_NAME
+      ),
+      GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,
+      CLERK_SECRET_KEY: !!process.env.CLERK_SECRET_KEY,
+    },
+  });
 }
 
 export async function POST(req: NextRequest) {
@@ -23,14 +38,17 @@ export async function POST(req: NextRequest) {
     const indexName = process.env.PINECONE_INDEX_NAME || process.env.INDEX_NAME;
     const geminiKey = process.env.GEMINI_API_KEY;
 
+    if (!process.env.DATABASE_URL) {
+      return jsonError("DATABASE_URL is not configured on Vercel", 500);
+    }
     if (!pineconeKey) {
-      return jsonError("PINECONE_API_KEY is not configured on the server", 500);
+      return jsonError("PINECONE_API_KEY is not configured on Vercel", 500);
     }
     if (!indexName) {
-      return jsonError("PINECONE_INDEX_NAME is not configured on the server", 500);
+      return jsonError("PINECONE_INDEX_NAME is not configured on Vercel", 500);
     }
     if (!geminiKey) {
-      return jsonError("GEMINI_API_KEY is not configured on the server", 500);
+      return jsonError("GEMINI_API_KEY is not configured on Vercel", 500);
     }
 
     const { userId: clerkId } = getAuth(req);
@@ -75,11 +93,17 @@ export async function POST(req: NextRequest) {
 
     console.log("📄 File received:", file.name, "Size:", file.size, "Type:", file.type);
 
+    if (file.size > 4_000_000) {
+      return jsonError("Resume must be under ~4MB on Vercel Hobby plans.", 400);
+    }
+
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
+    // Dynamic import avoids ESM/pdfjs crashing the whole route at module load on Vercel.
     console.log("🔍 Parsing PDF...");
-    const pdfData = await pdf(buffer);
+    const { pdf } = await import("pdf-parse");
+    const pdfData = await pdf(new Uint8Array(buffer));
     const fullText = (pdfData.text || "").trim();
     console.log("📜 Extracted text length:", fullText.length);
 
@@ -105,8 +129,7 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    // Vercel has a read-only filesystem (except /tmp). We already store
-    // fullResumeText in Postgres, so a durable local PDF path is not required.
+    // No local disk write — Vercel filesystem is read-only outside /tmp.
     const resumeId = uuidv4();
     const filePath = `memory://${resumeId}.pdf`;
 
@@ -130,15 +153,14 @@ export async function POST(req: NextRequest) {
     const namespace = index.namespace(resumeId);
 
     let chunkCount = 0;
-    let skippedEmpty = 0;
+    let embeddedCount = 0;
 
     for (const chunk of chunks) {
       chunkCount++;
       const embedding = await embedTextWithGemini(chunk);
 
       if (!embedding || embedding.length === 0) {
-        skippedEmpty++;
-        console.warn(`⚠️ Empty embedding for chunk ${chunkCount}, skipping Pinecone upsert`);
+        console.warn(`⚠️ Empty embedding for chunk ${chunkCount}, skipping`);
         continue;
       }
 
@@ -157,18 +179,17 @@ export async function POST(req: NextRequest) {
           metadata: { documentId: document.id, content: chunk },
         },
       ]);
+      embeddedCount++;
     }
 
-    if (chunkCount - skippedEmpty === 0) {
+    if (embeddedCount === 0) {
       return jsonError(
-        "Failed to create resume embeddings. Check GEMINI_API_KEY / model access.",
+        "Failed to create resume embeddings. Check GEMINI_API_KEY / model access on Vercel.",
         500
       );
     }
 
-    console.log(
-      `✅ Upload complete. chunks=${chunkCount}, embedded=${chunkCount - skippedEmpty}, skipped=${skippedEmpty}`
-    );
+    console.log(`✅ Upload complete. chunks=${chunkCount}, embedded=${embeddedCount}`);
 
     return NextResponse.json({
       success: true,
@@ -178,17 +199,13 @@ export async function POST(req: NextRequest) {
   } catch (error: unknown) {
     const err = error as { message?: string; code?: string; meta?: unknown; stack?: string };
     console.error("❌ [UPLOAD ERROR]:", err);
-    console.error("📛 Stack trace:", err?.stack || "No stack available");
-    if (err?.code) {
-      console.error("🧩 Error Code:", err.code);
-      console.error("🧾 Meta:", err.meta);
-    }
+    console.error("📛 Stack:", err?.stack || String(error));
 
-    const message =
-      err?.message ||
-      (typeof error === "string" ? error : "Unexpected server error during upload");
-
-    return jsonError(message, 500);
+    return jsonError(
+      err?.message || "Unexpected server error during upload",
+      500,
+      { code: err?.code ?? null }
+    );
   } finally {
     console.log("🔚 [END] Upload route finished at:", new Date().toISOString());
   }
