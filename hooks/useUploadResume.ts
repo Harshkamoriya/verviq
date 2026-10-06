@@ -40,8 +40,14 @@ export const useUploadResume = (options?: UploadResumeOptions) => {
     },
     onError: (error: any) => {
       toast.dismiss();
+      const data = error.response?.data;
       const message =
-        error.response?.data?.message || error.message || "Upload failed";
+        (typeof data === "object" && data?.message) ||
+        (typeof data === "string" && !data.startsWith("<!DOCTYPE")
+          ? data
+          : null) ||
+        error.message ||
+        "Upload failed";
       toast.error(message);
       console.error("Upload error:", error);
     },
