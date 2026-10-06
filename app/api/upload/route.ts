@@ -100,11 +100,13 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Dynamic import avoids ESM/pdfjs crashing the whole route at module load on Vercel.
+    // unpdf works on Vercel serverless (no pdfjs worker file path issues).
     console.log("🔍 Parsing PDF...");
-    const { pdf } = await import("pdf-parse");
-    const pdfData = await pdf(new Uint8Array(buffer));
-    const fullText = (pdfData.text || "").trim();
+    const { extractText } = await import("unpdf");
+    const pdfResult = await extractText(new Uint8Array(buffer), {
+      mergePages: true,
+    });
+    const fullText = (typeof pdfResult.text === "string" ? pdfResult.text : pdfResult.text.join("\n")).trim();
     console.log("📜 Extracted text length:", fullText.length);
 
     if (!fullText || fullText.length < 50) {
