@@ -10,6 +10,9 @@
 !.yarn/releases
 !.yarn/versions
 
+# local npm cache (never commit)
+.npm-cache/
+
 # testing
 /coverage
 

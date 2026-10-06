@@ -1,7 +1,5 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const genAi = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-
 // Models to try in order — both are currently active (July 2025)
 // gemini-1.5-* are shut down; gemini-2.5-flash-lite is the lightweight fallback
 const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash-latest", "gemini-pro"];
@@ -9,12 +7,21 @@ const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash-l
 const MAX_RETRIES = 4;
 const BASE_DELAY_MS = 2000; // 2s, 4s, 8s, 16s
 
+function getGenAi() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not set");
+  }
+  return new GoogleGenerativeAI(apiKey);
+}
+
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function generateWithGemini(prompt: string): Promise<string> {
   let lastError: unknown;
+  const genAi = getGenAi();
 
   for (const modelName of MODELS) {
     const model = genAi.getGenerativeModel({ model: modelName });

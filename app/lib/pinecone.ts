@@ -1,15 +1,33 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Pinecone } from "@pinecone-database/pinecone";
 
-const pinecone = new Pinecone({
-  apiKey: process.env.PINECONE_API_KEY!,
-});
+// Lazy init — Next.js evaluates route imports at build time.
+// Constructing Pinecone with a missing key throws and fails `next build`.
+function getPineconeIndex() {
+  const apiKey = process.env.PINECONE_API_KEY;
+  const indexName = process.env.PINECONE_INDEX_NAME;
+  if (!apiKey) {
+    throw new Error("PINECONE_API_KEY is not set");
+  }
+  if (!indexName) {
+    throw new Error("PINECONE_INDEX_NAME is not set");
+  }
+  return new Pinecone({ apiKey }).index(indexName);
+}
 
-const genAi = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const index = pinecone.index(process.env.PINECONE_INDEX_NAME!);
+function getGenAi() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not set");
+  }
+  return new GoogleGenerativeAI(apiKey);
+}
 
 export async function queryResumeChunks(resumeId: string, query: string, topK: number = 10) {
   console.log("📌 queryResumeChunks called with:", { resumeId, query, topK });
+
+  const genAi = getGenAi();
+  const index = getPineconeIndex();
 
   // --- Generate embedding ---
   console.log("🧠 Generating embedding for query...");

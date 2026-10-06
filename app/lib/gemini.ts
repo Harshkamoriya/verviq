@@ -1,12 +1,19 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+function getGenAI() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not set");
+  }
+  return new GoogleGenerativeAI(apiKey);
+}
 
 export async function embedTextWithGemini(text: string): Promise<number[]> {
   try {
     console.log("Inside embedTextWithGemini function");
     console.log("🔑 GEMINI_API_KEY:", process.env.GEMINI_API_KEY ? "Loaded ✅" : "❌ Missing");
 
+    const genAI = getGenAI();
     // Use a stable Gemini Embedding model (gemini-embedding-001 is most compatible)
     const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
 
@@ -40,9 +47,7 @@ console.log(process.env.GEMINI_API_KEY, "GEMINI_API_KEY");
         throw new Error("GEMINI_API_KEY is not set");
     }
   try {
-
-
-
+    const genAI = getGenAI();
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     console.log("[DEBUG] Gemini model initialized.");
 
