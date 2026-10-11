@@ -55,3 +55,5 @@ next-env.d.ts
 test_aai.js
 test_aai2.js
 aai_logs.json
+
+.vercel
